@@ -2,13 +2,13 @@ package internal
 
 // manifest_handler.go
 //
-// pkg/registry (v0.20.x) does NOT expose a ManifestHandler interface or a
-// WithManifestHandler option. All manifest routing is handled inside the
-// unexported `manifests` struct of registry.New().
+// pkg/registry (v0.20.x) exposes no ManifestHandler hook. Manifest routing
+// lives in the unexported `manifests` struct of registry.New().
 //
-// The correct intercept point is a plain HTTP middleware that matches the OCI
-// manifest URL pattern BEFORE the request reaches registry.New(). This file
-// implements that middleware and the upstream fetch logic.
+// The correct intercept point is an HTTP middleware that matches the OCI
+// manifest URL pattern before the request reaches registry.New(). This file
+// implements that middleware and the upstream fetch using the bearer token
+// the runtime already obtained (stored in the request context by authMiddleware).
 
 import (
 	"encoding/json"
@@ -26,17 +26,15 @@ import (
 )
 
 // manifestPattern matches /v2/<repo>/manifests/<ref>
-// where <repo> may contain multiple path segments (e.g. "library/nginx").
+// <repo> may contain multiple path segments (e.g. "library/nginx").
 var manifestPattern = regexp.MustCompile(`^/v2/(.+)/manifests/([^/]+)$`)
 
-// manifestMiddleware returns an http.Handler that:
-//  1. Intercepts GET and HEAD /v2/<repo>/manifests/<ref>
-//  2. Evaluates the policy — returns 403 JSON on deny
-//  3. Fetches the manifest from upstream via remote.Get and writes it directly
-//  4. Passes every other request through to `next` (registry.New())
+// manifestMiddleware intercepts GET/HEAD /v2/<repo>/manifests/<ref>,
+// applies policy, and fetches the manifest from upstream using the bearer
+// token extracted from the request context by authMiddleware.
+// All other paths are passed through to `next` (registry.New()).
 func manifestMiddleware(upstream string, policy Policy, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Only intercept manifest routes; everything else goes to the registry handler.
 		m := manifestPattern.FindStringSubmatch(r.URL.Path)
 		if m == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 			next.ServeHTTP(w, r)
@@ -45,7 +43,6 @@ func manifestMiddleware(upstream string, policy Policy, logger *slog.Logger, nex
 
 		repo := m[1]
 		ref := m[2]
-
 		logger.Info("manifest request", "method", r.Method, "repo", repo, "ref", ref)
 
 		// ── 1. Policy ─────────────────────────────────────────────────────────
@@ -55,7 +52,7 @@ func manifestMiddleware(upstream string, policy Policy, logger *slog.Logger, nex
 			return
 		}
 
-		// ── 2. Build the upstream reference ───────────────────────────────────
+		// ── 2. Build upstream reference ───────────────────────────────────────
 		var refStr string
 		if strings.HasPrefix(ref, "sha256:") {
 			refStr = fmt.Sprintf("%s/%s@%s", upstream, repo, ref)
@@ -70,15 +67,17 @@ func manifestMiddleware(upstream string, policy Policy, logger *slog.Logger, nex
 			return
 		}
 
-		// ── 3. Fetch from upstream ─────────────────────────────────────────────
-		// remote.Get returns a *remote.Descriptor which carries:
-		//   .Manifest    []byte         — raw manifest bytes
-		//   .MediaType   types.MediaType
-		//   .Digest      v1.Hash
-		//   .Size        int64
+		// ── 3. Build authenticator from context token ─────────────────────────
+		// authMiddleware extracted the runtime's Bearer token and stored it in
+		// the context. We replay it on the upstream call via RegistryToken so
+		// go-containerregistry forwards it as "Authorization: Bearer <token>".
+		// Falls back to Anonymous for public registries (empty token).
+		auth := authenticatorFromContext(r)
+
+		// ── 4. Fetch manifest from upstream ───────────────────────────────────
 		desc, err := remote.Get(parsed,
 			remote.WithContext(r.Context()),
-			remote.WithAuth(authn.Anonymous),
+			remote.WithAuth(auth),
 		)
 		if err != nil {
 			status := statusFromErr(err)
@@ -95,26 +94,38 @@ func manifestMiddleware(upstream string, policy Policy, logger *slog.Logger, nex
 			"size", len(desc.Manifest),
 		)
 
-		// ── 4. Write the response ──────────────────────────────────────────────
+		// ── 5. Write response ─────────────────────────────────────────────────
 		w.Header().Set("Content-Type", string(desc.MediaType))
 		w.Header().Set("Docker-Content-Digest", desc.Digest.String())
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(desc.Manifest)))
 
 		if r.Method == http.MethodHead {
-			// HEAD: headers only, no body
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(desc.Manifest)))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-
-		// GET: write raw manifest bytes
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(desc.Manifest)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(desc.Manifest)
 	})
 }
 
-// statusFromErr extracts the HTTP status code from a transport.Error,
-// falling back to 502 Bad Gateway for unknown errors.
+// authenticatorFromContext builds an authn.Authenticator from the bearer token
+// stored in the request context by authMiddleware.
+// If no token is present (anonymous/public registry), returns authn.Anonymous.
+func authenticatorFromContext(r *http.Request) authn.Authenticator {
+	token := tokenFromContext(r.Context())
+	if token == "" {
+		return authn.Anonymous
+	}
+	// authn.FromConfig with RegistryToken causes go-containerregistry to send
+	// "Authorization: Bearer <token>" on every upstream request — exactly what
+	// the upstream registry expects after issuing the token to the runtime.
+	return authn.FromConfig(authn.AuthConfig{
+		RegistryToken: token,
+	})
+}
+
+// statusFromErr extracts the HTTP status code from a transport.Error.
+// Falls back to 502 Bad Gateway for unknown error types.
 func statusFromErr(err error) int {
 	var te *transport.Error
 	if errors.As(err, &te) {

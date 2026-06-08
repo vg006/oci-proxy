@@ -24,22 +24,24 @@ type Config struct {
 	Logger *slog.Logger
 }
 
-// NewHandler returns an http.Handler that is a policy-enforcing OCI
-// pull-through proxy built entirely on go-containerregistry.
+// NewHandler returns an http.Handler that is a policy-enforcing, auth-aware
+// OCI pull-through proxy built entirely on go-containerregistry.
 //
-// Architecture:
+// Request pipeline (outermost → innermost):
 //
-//	manifestMiddleware  ← HTTP middleware: intercepts /v2/.../manifests/...
-//	      │                  applies policy, fetches from upstream via remote.Get
-//	      │
-//	registry.New()      ← pkg/registry: handles /v2/, /v2/.../blobs/...
-//	      │                  uses our blobHandler for blob GET/HEAD
-//	      │
-//	blobHandler         ← implements registry.BlobHandler + registry.BlobStatHandler
-//	                         streams blobs from upstream via remote.Layer
-//
-// NOTE: pkg/registry has NO WithManifestHandler option (as of v0.20.x).
-// The manifest interception is done by the HTTP middleware layer above registry.New().
+//	requestLogger          ← logs every HTTP request + status code
+//	  │
+//	  authMiddleware       ← /v2/: relay upstream challenge
+//	  │                      /v2/token,/v2/auth: reverse-proxy to upstream
+//	  │                      everything else: extract Bearer token → context
+//	  │
+//	  manifestMiddleware   ← GET/HEAD /v2/.../manifests/...:
+//	  │                      policy check → upstream fetch via token in context
+//	  │
+//	  registry.New()       ← OCI Distribution v2 HTTP router (blob routes)
+//	        │
+//	        blobHandler    ← GET/HEAD /v2/.../blobs/...:
+//	                          stream from upstream via token in context
 func NewHandler(cfg Config) (http.Handler, error) {
 	if cfg.UpstreamRegistry == "" {
 		return nil, fmt.Errorf("UpstreamRegistry must be set")
@@ -51,32 +53,40 @@ func NewHandler(cfg Config) (http.Handler, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	// blobHandler satisfies both registry.BlobHandler (Get) and
-	// registry.BlobStatHandler (Stat). The registry detects the latter
-	// via a type assertion and uses it for HEAD /v2/.../blobs/<digest>.
+	// ── 1. Blob handler ───────────────────────────────────────────────────────
+	// Implements registry.BlobHandler (Get) + registry.BlobStatHandler (Stat).
+	// registry.New() detects BlobStatHandler via type assertion.
 	bh := &blobHandler{
 		upstream: cfg.UpstreamRegistry,
 		logger:   cfg.Logger,
 	}
 
-	// registry.New() builds the spec-compliant OCI Distribution v2 router.
-	// registry.Logger takes a *log.Logger — we pass a discard logger because
-	// our structured slog output in the handlers replaces it.
+	// ── 2. Inner registry handler (blob routes + /v2/ boilerplate) ───────────
+	// registry.Logger takes a *log.Logger — pass a discard logger since our
+	// structured slog output in the handlers replaces it entirely.
 	discardLogger := log.New(io.Discard, "", 0)
 	inner := registry.New(
 		registry.WithBlobHandler(bh),
 		registry.Logger(discardLogger),
 	)
 
-	// manifestMiddleware wraps inner: it intercepts manifest routes first,
-	// applies policy, and fetches directly from upstream.
-	// All other routes (version check, blob routes) fall through to inner.
-	handler := manifestMiddleware(cfg.UpstreamRegistry, cfg.Policy, cfg.Logger, inner)
+	// ── 3. Manifest middleware (wraps inner) ──────────────────────────────────
+	// Intercepts GET/HEAD /v2/<repo>/manifests/<ref> before they reach the
+	// registry handler (which has no manifest hook). Applies policy and fetches
+	// from upstream using the token from context.
+	withManifests := manifestMiddleware(
+		cfg.UpstreamRegistry, cfg.Policy, cfg.Logger, inner,
+	)
 
-	return requestLogger(cfg.Logger, handler), nil
+	// ── 4. Auth middleware (outermost content handler) ────────────────────────
+	// Handles /v2/ challenge relay, /v2/token passthrough, and token extraction.
+	withAuth := authMiddleware(cfg.UpstreamRegistry, cfg.Logger, withManifests)
+
+	// ── 5. Request logger ─────────────────────────────────────────────────────
+	return requestLogger(cfg.Logger, withAuth), nil
 }
 
-// requestLogger is a thin middleware that logs every HTTP request + response status.
+// requestLogger logs every HTTP request with method, path, and response status.
 func requestLogger(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
