@@ -29,11 +29,13 @@ func main() {
 	if upstream == "" {
 		upstream = "registry-1.docker.io"
 	}
+	slog.Info("using upstream registry", "upstream", upstream)
 
 	listenAddr := os.Getenv("LISTEN_ADDR")
 	if listenAddr == "" {
 		listenAddr = ":5000"
 	}
+	slog.Info("using listen address", "addr", listenAddr)
 
 	slog.Info("starting OCI proxy",
 		"listen", listenAddr,
